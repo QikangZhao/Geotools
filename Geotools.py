@@ -20,6 +20,8 @@ import glob
 import shutil
 import geopandas as gpd
 import salem
+from rasterio.warp import calculate_default_transform, reproject, Resampling
+
 
 def check_dir(dir):
     # 查看文件夹是否存在, 如果不存在则创建一个
@@ -104,7 +106,7 @@ def spatial_interpolate(inpath='',savepath='',lat_first=-90,lat_res=1,lat_nums=1
     ds_new = ds.interp(lat=new_lats,lon=new_lons, method=method)
     ds_new.to_netcdf(savepath,encoding={var:{'zlib':True,'complevel':4,'dtype':'float32','least_significant_digit':sig_num} for var in ds_new.data_vars})
 
-def mask_nc(ncpath='', savepath='', maskpath='',sig_num=2):
+def mask_data(inputpath='', save=False, savepath='', maskpath='',sig_num=2):
     '''
     # 裁剪nc文件
     ncpath:打开路径
@@ -112,9 +114,17 @@ def mask_nc(ncpath='', savepath='', maskpath='',sig_num=2):
     maskpath:用于裁剪的shapefile, 使用WGS 1984地理坐标系
     '''
     mask_shp = gpd.read_file(maskpath)
-    ds = xr.open_dataset(ncpath)
+    input_type = Path(inputpath).suffix()
+    if input_type=='.nc':
+        engine = 'netcdf'
+    elif input_type=='.tif':
+        engine = 'rasterio'
+    else:
+        print(f'Unknown input file type: {input_type[1:]}')
+    ds = xr.open_dataset(inputpath, engine=engine)
     data_masked = ds.salem.roi(shape=mask_shp)
-    data_masked.to_netcdf(savepath, encoding={var:{'zlib':True,'complevel':4,'dtype':'float32','least_significant_digit':sig_num} for var in ds.data_vars})
+    if save:
+        data_masked.to_netcdf(savepath, encoding={var:{'zlib':True,'complevel':4,'dtype':'float32','least_significant_digit':sig_num} for var in ds.data_vars})
 
 def zonal_nc(varname='', ncpath='', maskpath='', \
             savetype='csv', outputpath='\.csv', \
@@ -126,7 +136,7 @@ def zonal_nc(varname='', ncpath='', maskpath='', \
     ncpath: 打开nc路径,nc默认形状(time,lat,lon)
     maskpath: 用于裁剪的shapefile, 使用WGS 1984地理坐标系
     
-    savetype: 支持输出csv格式或者shp格式
+    savetype: 支持输出csv格式或者shp格式;
     outputpath: 分区统计结束保存路径
     
     sel_time:支持选择某一个时间节点进行区域统计
@@ -162,35 +172,23 @@ def zonal_nc(varname='', ncpath='', maskpath='', \
         zonal_data[i,:] = data_masked_series[varname].values
     if savetype=='shp':
         new_attributes = np.concatenate((mask_shp.values, zonal_data), axis=1)
-        new_columns = list(mask_shp.columns) + list((np.array(ds.time.values).reshape(2,1)))#32+?
-        new_shp = gpd.GeoDataFrame(new_attributes, columns=new_columns, geometry=mask_shp.geometry)
-        new_shp.to_file(outputpath)
+        times = ['T'+str(y) for y in ds.time.values]
+        new_columns = list(mask_shp.columns) + list(times)#32+?
+        df = pd.DataFrame(new_attributes,columns=new_columns)
+        for column in df.columns:
+            try:
+                df[column] = df[column].astype(np.float32)
+            except:
+                pass
+        new_shp = gpd.GeoDataFrame(df, geometry=mask_shp.geometry)
+        new_shp.to_file(outputpath, driver='ESRI Shapefile')
     elif savetype=='csv':
         zonal_ds =  pd.DataFrame(zonal_data,
                                 index = mask_shp[zone_col_name], 
                                 columns = ds.time.values)
         zonal_ds.to_csv(outputpath)
-    
-def tif2nc(inpath='', outpath='', time='1', varname='var', sig_num=2):
-    if os.path.exists(inpath):
-        return
-    with rasterio.open(inpath) as src:  # 读取tif
-        im_height, im_width = src.height, src.width  # 获取高度和宽度
-        im_transform = src.transform  # 获取仿射变换矩阵
-        im_data = src.read(1, masked=True)  # 读取第一个波段的数据
-        im_data = np.expand_dims(im_data, axis=0)  # 增加时间维度作为第一维
-    data_attr = dict(standard_name=varname, units="Default")
-    # 根据im_transform得到图像的经纬度信息
-    im_lon = [im_transform[2] + i * im_transform[0] for i in range(im_width)]
-    lon_attr = dict(standard_name="lon", units="degree")
-    im_lat = [im_transform[5] + i * im_transform[4] for i in range(im_height)]
-    lat_attr = dict(standard_name="lat", units="degree")
-    dims = ['time', 'lat', 'lon']
-    im_nc = xr.Dataset({
-        varname: (dims, im_data, data_attr)},
-        coords={"time": [time], "lat": (["lat"], im_lat, lat_attr), "lon": (["lon"], im_lon, lon_attr)})
-    im_nc.to_netcdf(outpath, encoding={varname: {'zlib': True, 'complevel': 4, 'dtype': 'float32', 'least_significant_digit': sig_num}})
 
+    
 def nc2tifs(ncpath='', varname='var', prefix='var_', output_folder=''):
     ds = xr.open_dataset(ncpath)
     times, lats, lons = ds.time.values, ds.lat.values, ds.lon.values
@@ -207,4 +205,62 @@ def nc2tifs(ncpath='', varname='var', prefix='var_', output_folder=''):
                            crs='EPSG:4326', transform=transform) as dst:
             dst.write(data[i][::-1], 1)  # [::-1]用于图像的垂直镜像对称，避免图像颠倒
             
-            
+def tiff2nc(inpath='', outpath='', varname = 'value', projection=False):
+    if os.path.exists(outpath):
+        return
+    with rasterio.open(inpath) as src:
+        im_data = src.read()  # 读取第一个波段的数据
+        src_geotrans = src.transform  # 获取地理转换信息
+        src_crs = src.crs # 获取坐标系
+        src_width = src.width
+        src_height = src.height
+        src_bounds = src.bounds # 获取图像范围
+    # 如果具有投影坐标系，则需要处理坐标转换
+    if projection:
+        # 获取源和目标坐标系信息
+        dst_crs = rasterio.crs.CRS.from_epsg(4326)  # EPSG 4326 表示经纬度坐标系
+        dst_transform, dst_width, dst_height = calculate_default_transform(
+                src_crs,dst_crs, 
+                src_width, src_height, 
+                *src_bounds)
+        profile = src.meta.copy()
+        profile.update({'crs': dst_crs,'transform': dst_transform,'width': dst_width,'height': dst_height})
+        del src
+        # 重投影
+        dst_array = np.empty((dst_height, dst_width), dtype=profile['dtype']) # 初始化输出图像数据
+        reproject(source=im_data, src_crs=src_crs, src_transform=src_geotrans,#原始数据参数
+                destination=dst_array, dst_transform=dst_transform, dst_crs=dst_crs,#目标参数
+                resampling=Resampling.bilinear, num_threads=2)
+        im_data = dst_array
+        min_lon, _ = dst_transform*(0,0)
+        _, min_lat = dst_transform*(dst_width, dst_height) 
+        lon_res, lat_res = dst_transform.a, -dst_transform.e
+        im_lon = [min_lon + i * lon_res for i in range(dst_width)]
+        im_lat = [min_lat + i * lat_res  for i in range(dst_height)]
+    else:
+        min_lon, _ = src_geotrans*(0,0)
+        _, min_lat = src_geotrans*(src_width, src_height) 
+        im_lon = [min_lon + i * lon_res for i in range(src_width)]
+        im_lat = [min_lat + i * lat_res  for i in range(src_height)]
+    lon_attr = dict(standard_name="lon", uints="degrees")
+    lat_attr = dict(standard_name="lat", uints="degrees")
+    im_data = np.expand_dims(im_data, axis=0)  # 增加时间维
+    im_data = np.where((im_data>1000)|(im_data<-1000), np.nan, im_data)
+    data_attr = dict(standard_name=varname, uints=" ")
+    dims = ['time', 'lat', 'lon']
+    date = np.array([date]).flatten()
+    im_lat = np.array([im_lat]).flatten()
+    im_lon = np.array([im_lon]).flatten()
+    im_nc = xr.Dataset({
+        "LST": (dims, im_data, data_attr)},
+        coords={"time": date,
+                "lat": (["lat"], im_lat, lat_attr),
+                "lon": (["lon"], im_lon, lon_attr)})
+    del im_data, im_lat, im_lon
+    new_lons = np.arange(-180,180,0.01)
+    new_lats = np.arange(-90,90,0.01)
+    im_nc.interp(lat=new_lats, lon=new_lons)
+    im_nc.to_netcdf(outpath, encoding={varname: {'zlib': True, 'complevel': 5, 'dtype': 'float32', 'least_significant_digit': 0}})
+    return im_nc, date
+
+      
