@@ -16,6 +16,7 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 import rasterio
+import rioxarray as rxr
 import glob
 import shutil
 import geopandas as gpd
@@ -116,12 +117,12 @@ def mask_data(inputpath='', save=False, savepath='', maskpath='',sig_num=2):
     mask_shp = gpd.read_file(maskpath)
     input_type = Path(inputpath).suffix()
     if input_type=='.nc':
-        engine = 'netcdf'
+        ds = xr.open_dataset(inputpath)
     elif input_type=='.tif':
-        engine = 'rasterio'
+        ds = rxr.open_rasterio(inputpath)
     else:
         print(f'Unknown input file type: {input_type[1:]}')
-    ds = xr.open_dataset(inputpath, engine=engine)
+    
     data_masked = ds.salem.roi(shape=mask_shp)
     if save:
         data_masked.to_netcdf(savepath, encoding={var:{'zlib':True,'complevel':4,'dtype':'float32','least_significant_digit':sig_num} for var in ds.data_vars})
